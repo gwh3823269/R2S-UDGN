@@ -1,0 +1,317 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Mon Nov 25 15:17:15 2025
+
+@author: Administrator
+"""
+
+
+from torch.nn.modules.container import ModuleList
+import torch.nn as nn
+from layer_PGCN import LocalLayer, MesoLayer, GlobalLayer, DynamicGraphConv
+import torch
+import eeg_utils
+
+from eeg_utils import normalize_adj
+import torch.nn.functional as F
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+ class TwoStageUncertaintyGuidedGraphAugmentation(nn.Module):
+     def __init__(self, in_channels, hidden_dim=64, use_stat_norm=False, fusion_mode='mask'):
+         super(TwoStageUncertaintyGuidedGraphAugmentation, self).__init__()
+         self.use_stat_norm = use_stat_norm
+         self.fusion_mode = fusion_mode
+        
+         self.uncertainty_refiner = nn.Sequential(
+             nn.Linear(in_channels + 2, hidden_dim),
+             nn.ReLU(),
+             nn.Linear(hidden_dim, 1),
+             nn.Sigmoid()
+         )
+        
+         self.edge_weight_predictor = nn.Sequential(
+             nn.Linear(in_channels * 2, hidden_dim),
+             nn.ReLU(),
+             nn.Linear(hidden_dim, 1),
+             nn.Sigmoid()
+         )
+        
+         if fusion_mode == 'blend':
+             self.alpha = nn.Parameter(torch.tensor(0.5))
+
+     def compute_statistical_uncertainty(self, x):
+         mean = torch.mean(x, dim=-1, keepdim=True)
+         var = torch.var(x, dim=-1, unbiased=False, keepdim=True)
+         stat_features = torch.cat([mean, var], dim=-1)
+        
+         if self.use_stat_norm:
+             mean_stat = stat_features.mean(dim=1, keepdim=True)
+             std_stat = stat_features.std(dim=1, keepdim=True) + 1e-8
+             stat_features = (stat_features - mean_stat) / std_stat
+        
+         return stat_features, mean, var
+
+     def forward(self, x, adj_prior):
+         B, N, C = x.shape
+         stat_features, mean, var = self.compute_statistical_uncertainty(x)
+         x_with_stat = torch.cat([x, stat_features], dim=-1)
+         refined_uncertainty = self.uncertainty_refiner(x_with_stat)
+         uncertainty = refined_uncertainty.squeeze(-1)
+
+         x_i = x.unsqueeze(2).expand(B, N, N, C)
+         x_j = x.unsqueeze(1).expand(B, N, N, C)
+         edge_input = torch.cat([x_i, x_j], dim=-1)
+         edge_weights = self.edge_weight_predictor(edge_input.view(-1, 2*C))
+         edge_weights = edge_weights.view(B, N, N)
+
+         if self.fusion_mode == 'mask':
+             adj_aug = adj_prior * edge_weights
+         elif self.fusion_mode == 'blend':
+             alpha = torch.sigmoid(self.alpha)
+             adj_aug = alpha * edge_weights + (1 - alpha) * adj_prior
+         else:
+             raise ValueError(f"Unsupported fusion_mode: {self.fusion_mode}")
+        
+         u_i = refined_uncertainty.expand(B, N, N)
+         u_j = refined_uncertainty.permute(0, 2, 1).expand(B, N, N)
+         adj_aug = adj_aug * (1 - u_i * u_j + 1e-8)
+         adj_aug = adj_aug * (1 - torch.eye(N, device=x.device).unsqueeze(0))
+
+         return adj_aug, uncertainty, (mean, var)
+
+class TemporalConvNet(nn.Module):
+    def __init__(self, in_channels=310, out_channels=128, kernel_size=7, dropout=0.25):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv1d(in_channels, 64, kernel_size=kernel_size, padding=kernel_size//2),
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Conv1d(64, out_channels, kernel_size=kernel_size, padding=kernel_size//2),
+            nn.BatchNorm1d(out_channels),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            
+            # 全局平均池化 → 固定长度输出
+            nn.AdaptiveAvgPool1d(1)  # 输出 [B, 128, 1]
+        )
+    
+    def forward(self, x):  # x: [B, T, 310] → 转置为 [B, 310, T]
+        x = x.transpose(1, 2)  # [B, 310, T]
+        out = self.net(x).squeeze(-1)  # [B, 128]
+        return out
+
+# #################注意力机制融合#################
+# class PGCN(nn.Module):
+#     """
+#     PGCN with Uncertainty-Guided Graph Augmentation
+#     Attention-based fusion (gate attention, drop-in replacement)
+#     """
+#     def __init__(self, args, local_adj, coor):
+#         super(PGCN, self).__init__()
+#         self.args = args
+#         self.nclass = args.n_class
+#         self.dropout = args.dropout
+#         self.l_relu = args.lr
+#         self.adj = local_adj  # [N, N] static prior adjacency
+#         self.coordinate = coor
+#     
+#         self.graph_augmentor = TwoStageUncertaintyGuidedGraphAugmentation(
+#             in_channels=args.in_feature,
+#             hidden_dim=64,
+#             use_stat_norm=False,
+#             fusion_mode='mask'
+#         )
+#         # GCN layers
+#         self.local_gcn_1 = DynamicGraphConv(args.in_feature, 10, dropout=self.dropout)
+#         self.local_gcn_2 = DynamicGraphConv(10, 15, dropout=self.dropout)
+#         self.static_mlp = nn.Sequential(
+#             nn.Linear(62*5, 256),
+#             nn.Linear(256, 128),
+#             nn.Linear(128, 256),
+#             nn.ReLU(),
+#             nn.Dropout(0.25)
+#         )
+#         # Temporal branch
+#         self.rnn1 = nn.LSTM(
+#             input_size=256,
+#             hidden_size=256,
+#             num_layers=2,
+#             batch_first=True,
+#             dropout=0.25,
+#             bidirectional=False,
+#         )
+#         self.module = nn.Sequential(
+#             nn.Linear(256, 128),  # 128*2 (bidirectional) → 128
+#             nn.BatchNorm1d(128),
+#             nn.LeakyReLU(negative_slope=0.01, inplace=True)
+#         )
+#         # Fusion & Classification
+#         self.mlp0 = nn.Linear(62 * 30, 128)  # from concatenated local features
+
+#   
+#         self.attn_gate = nn.Sequential(
+#             nn.Linear(128 * 2, 128),
+#             nn.Sigmoid()
+#         )
+#         # ====================================================
+
+#         self.module2 = nn.Sequential(
+#             nn.Linear(128, 64),
+#             nn.BatchNorm1d(64),
+#             nn.LeakyReLU(negative_slope=0.01, inplace=True)
+#         )
+        
+#         self.lrelu = nn.ReLU(self.l_relu)
+#   
+#         # self.w = nn.Parameter(torch.zeros(3)) 
+
+#     def forward(self, x):
+#         # x: [B, N=62, C=5]
+#         B, N, C = x.shape
+#         # === Step 1: 动态图增强 + 不确定性估计 ===
+#         adj_prior = self.adj.unsqueeze(0).expand(B, N, N).to(x.device)
+#         adj_aug, uncertainty, _ = self.graph_augmentor(x, adj_prior)
+#         laplacian = normalize_adj(adj_aug)  # [B, N, N]
+#         #laplacian = normalize_adj(adj_prior)  # [B, N, N]
+        
+#         mean_laplacian = laplacian.mean(dim=0)
+#      
+#         node_importance = (1.0 - uncertainty).unsqueeze(-1)  # [B, N, 1]
+        
+#         x_weighted = x * node_importance  # 抑制高不确定性节点
+#         B,N,C=x_weighted.shape
+#         channel_importance=x_weighted.reshape(N,-1)
+#         channel_importance =channel_importance.mean(dim=1)
+        
+#         # === Step 3: Temporal branch (LSTM) ===
+#         # 将 x flatten 成 [B, 310]，再加时间维 [B, 1, 310]
+#         x_flat = x.view(B, -1).unsqueeze(1)  # [B, 1, 310]
+#         out = self.static_mlp(x_flat)  # [B, 256]
+#         #out, _ = self.rnn1(out)           # [B, 1, 256]
+#         out = out.squeeze(1)                 # [B, 256]
+#         out = self.module(out)               # [B, 128]
+#         # === Step 4: Local GCN with weighted features ===
+#         local_x1 = self.lrelu(self.local_gcn_1(x_weighted, laplacian))
+#         local_x2 = self.lrelu(self.local_gcn_2(local_x1, laplacian))
+#         res_local = torch.cat([x_weighted, local_x1, local_x2], dim=2)  # [B, 62, 30]
+#         x0 = self.mlp0(res_local.view(B, -1))  # [B, 128]
+
+#      
+#         feat_t = out   # 时序分支 [B,128]
+#         feat_g = x0    # 图分支 [B,128]
+#         gate = self.attn_gate(torch.cat([feat_t, feat_g], dim=-1))  # [B,128] 自适应门控
+#         fused_feat = gate * feat_t + (1.0 - gate) * feat_g
+#     
+
+#         final_feat = self.module2(fused_feat)  # [B, 64]
+#     
+#         return final_feat, uncertainty.mean(dim=1), mean_laplacian, channel_importance
+
+
+class PGCN(nn.Module):
+    """
+    PGCN with Uncertainty-Guided Graph Augmentation
+    """
+    def __init__(self, args, local_adj, coor):
+        super(PGCN, self).__init__()
+
+        self.args = args
+        self.nclass = args.n_class
+        self.dropout = args.dropout
+        self.l_relu = args.lr
+        self.adj = local_adj  # [N, N] static prior adjacency
+        self.coordinate = coor
+
+ 
+        self.graph_augmentor = TwoStageUncertaintyGuidedGraphAugmentation(
+            in_channels=args.in_feature,
+            hidden_dim=64,
+            use_stat_norm=False,
+            fusion_mode='mask'
+        )
+
+        # GCN layers
+        self.local_gcn_1 = DynamicGraphConv(args.in_feature, 10, dropout=self.dropout)
+        self.local_gcn_2 = DynamicGraphConv(10, 15, dropout=self.dropout)
+
+        self.static_mlp = nn.Sequential(
+            nn.Linear(62*5, 256),
+            nn.Linear(256, 128),
+            nn.Linear(128, 256),
+            nn.ReLU(),
+            nn.Dropout(0.25)
+        )
+        # Temporal branch
+        self.rnn1 = nn.LSTM(
+            input_size=256,
+            hidden_size=256,
+            num_layers=2,
+            batch_first=True,
+            dropout=0.25,
+            bidirectional=False,
+        )
+        self.module = nn.Sequential(
+            nn.Linear(256, 128),  # 128*2 (bidirectional) → 128
+            nn.BatchNorm1d(128),
+            nn.LeakyReLU(negative_slope=0.01, inplace=True)
+        )
+
+        # Fusion & Classification
+        self.mlp0 = nn.Linear(62 * 30, 128)  # from concatenated local features
+        self.w = nn.Parameter(torch.full((2,), 0.5))
+        self.module2 = nn.Sequential(
+            nn.Linear(128, 64),
+            nn.BatchNorm1d(64),
+            nn.LeakyReLU(negative_slope=0.01, inplace=True)
+        )
+        
+
+        self.lrelu = nn.ReLU(self.l_relu)
+        self.w = nn.Parameter(torch.zeros(3)) 
+
+    def forward(self, x):
+        # x: [B, N=62, C=5]
+        B, N, C = x.shape
+
+
+        adj_prior = self.adj.unsqueeze(0).expand(B, N, N).to(x.device)
+        adj_aug, uncertainty, _ = self.graph_augmentor(x, adj_prior)
+        laplacian = normalize_adj(adj_aug)  # [B, N, N]
+        #laplacian = normalize_adj(adj_prior)  # [B, N, N]
+        
+        mean_laplacian = laplacian.mean(dim=0)
+        
+        node_importance = (1.0 - uncertainty).unsqueeze(-1)  # [B, N, 1]
+        
+        x_weighted = x * node_importance  # 抑制高不确定性节点
+        B,N,C=x_weighted.shape
+        channel_importance=x_weighted.reshape(N,-1)
+        channel_importance =channel_importance.mean(dim=1)
+        # print('++'*100,channel_importance.shape)
+        # === Step 3: Temporal branch (LSTM) ===
+        # 将 x flatten 成 [B, 310]，再加时间维 [B, 1, 310]
+        x_flat = x.view(B, -1).unsqueeze(1)  # [B, 1, 310]
+        out = self.static_mlp(x_flat)  # [B, 256]
+        #out, _ = self.rnn1(out)           # [B, 1, 256]
+        out = out.squeeze(1)                 # [B, 256]
+        out = self.module(out)               # [B, 128]
+
+        # === Step 4: Local GCN with weighted features ===
+        local_x1 = self.lrelu(self.local_gcn_1(x_weighted, laplacian))
+        local_x2 = self.lrelu(self.local_gcn_2(local_x1, laplacian))
+        res_local = torch.cat([x_weighted, local_x1, local_x2], dim=2)  # [B, 62, 30]
+
+        x0 = self.mlp0(res_local.view(B, -1))  # [B, 128]
+
+   
+        w1 = torch.exp(self.w[0]) / torch.sum(torch.exp(self.w))
+        w2 = torch.exp(self.w[1]) / torch.sum(torch.exp(self.w))
+      #  fused_feat = w1 * out + w2 * x0  # [B, 128]
+      # fused_feat = out#只有TIE22
+        fused_feat = x0  # [B, 128]只有图24
+        final_feat = self.module2(fused_feat)  # [B, 64]
+
+
+        return final_feat, uncertainty.mean(dim=1),mean_laplacian,channel_importance  # [B, 64], [B]
