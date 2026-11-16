@@ -1,0 +1,154 @@
+# -*- coding: utf-8 -*-
+"""
+@author: whguo
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.nn.parameter import Parameter
+from torch.distributions.kl import kl_divergence
+from torch.distributions.categorical import Categorical
+
+from args import parse_args
+import eeg_utils
+from node_location import convert_dis_m, get_ini_dis_m, return_coordinates
+from un_PGCN import PGCN  # 
+
+
+def pretrained_CFE(args, pretrained=False, adj_matrix=None, coordinate_matrix=None):
+    if adj_matrix is None:
+        adj_matrix = Parameter(torch.FloatTensor(convert_dis_m(get_ini_dis_m(), 9))).to(args.device)
+
+    if coordinate_matrix is None:
+        coordinate_matrix = torch.FloatTensor(return_coordinates()).to(args.device)
+
+    model = PGCN(args, adj_matrix, coordinate_matrix)
+
+    if pretrained:
+        pass  # 可加载预训练权重
+    return model
+
+
+class DSFE(nn.Module):
+    def __init__(self):
+        super(DSFE, self).__init__()
+        self.module = nn.Sequential(
+            nn.Linear(64, 32),
+            nn.BatchNorm1d(32, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True),
+            nn.LeakyReLU(negative_slope=0.01, inplace=True)
+        )
+
+    def forward(self, x):
+        return self.module(x)
+
+
+class MSMDAERNet(nn.Module):
+    def __init__(self, pretrained=False, number_of_source=15, number_of_category=4):
+        args = parse_args()
+        super(MSMDAERNet, self).__init__()
+
+        self.sharedNet = pretrained_CFE(args, pretrained=pretrained)
+
+        self.DSFEs = nn.ModuleList()
+        self.cls_fcs = nn.ModuleList()
+
+        for _ in range(number_of_source):
+            self.DSFEs.append(DSFE())
+            self.cls_fcs.append(nn.Linear(32, number_of_category))
+
+        self.number_of_source = number_of_source
+    def forward(self, data_src, number_of_source, data_tgt=0, label_src=0, mark=0, epsilon=1):
+
+        device = data_src.device
+        mmd_loss = torch.tensor(0., device=device)
+        disc_loss = torch.tensor(0., device=device)
+        pacbayes_loss = torch.tensor(0., device=device)
+        adv_loss = torch.tensor(0., device=device)
+
+        if self.training:
+            data_src_CFE, src_uncert,mean_laplacian,channel_importance = self.sharedNet(data_src)      # [B, 64], [B]
+            data_tgt_CFE, _,mean_laplacian,channel_importance = self.sharedNet(data_tgt)               # 只需特征，可忽略 tgt_uncert
+
+
+            data_tgt_DSFE = [dsfe(data_tgt_CFE) for dsfe in self.DSFEs]
+            softmax_outputs = [F.softmax(feats, dim=1) for feats in data_tgt_DSFE]
+
+            data_src_DSFE = self.DSFEs[mark](data_src_CFE)
+            mmd_loss += eeg_utils.mmd(data_src_DSFE, data_tgt_DSFE[mark])
+
+            # Discrepancy loss
+            for i in range(len(data_tgt_DSFE)):
+                if i != mark:
+                    disc_loss += torch.mean(torch.abs(softmax_outputs[mark] - softmax_outputs[i]))
+            disc_loss /= (len(data_tgt_DSFE) - 1 + 1e-8)
+
+            for i in range(len(data_tgt_DSFE)):
+                if i != mark:
+                    p = Categorical(probs=softmax_outputs[mark])
+                    q = Categorical(probs=softmax_outputs[i])
+                    pacbayes_loss += kl_divergence(p, q).mean()
+            pacbayes_loss /= (self.number_of_source - 1 + 1e-8)
+
+
+            pred_src = self.cls_fcs[mark](data_src_DSFE)  # [B, num_class]
+            
+
+            src_uncert_norm = torch.sigmoid(src_uncert)          # 映射到 (0,1)
+          #  weights = 1.0 - src_uncert_norm                      # [B]
+            
+
+          #  log_probs = F.log_softmax(pred_src, dim=1)
+          #  cls_loss_per_sample = F.nll_loss(log_probs, label_src.squeeze(), reduction='none')  # [B]
+          #  cls_loss = (weights * cls_loss_per_sample).mean()
+            cls_loss = F.nll_loss(F.log_softmax(pred_src, dim=1), label_src.squeeze())
+  
+            # === 自适应对抗攻击 ===
+            data_adv = self.fgm_attack(
+                data_src_CFE,
+                label_src,
+                mark,
+                epsilon=0.5,
+                uncertainty=src_uncert_norm#src_uncert_norm  # None← 关键：传入不确定性
+            )
+            pred_adv = self.cls_fcs[mark](self.DSFEs[mark](data_adv))
+            adv_loss = F.nll_loss(F.log_softmax(pred_adv, dim=1), label_src.squeeze())
+                    
+            return  cls_loss, mmd_loss, disc_loss,pacbayes_loss, adv_loss,mean_laplacian,channel_importance
+
+        else:
+            # 推理阶段：只需特征，不关心 uncertainty
+            data_CFE, _,mean_laplacian,channel_importance= self.sharedNet(data_src)
+            preds = [cls(dsfe(data_CFE)) for dsfe, cls in zip(self.DSFEs, self.cls_fcs)]
+            return preds
+
+    def fgm_attack(self, data, labels, mark, epsilon, uncertainty=None):
+        """
+        Fast Gradient Method with Uncertainty-Adaptive Perturbation.
+        
+        Args:
+            data: [B, D] shared features
+            labels: [B] source labels
+            mark: int, current source domain index
+            epsilon: float, base perturbation magnitude
+            uncertainty: [B], optional, sample-level uncertainty in [0,1]
+                         higher uncertainty → smaller perturbation
+        """
+        data = data.clone().detach().requires_grad_(True)
+        output = self.cls_fcs[mark](self.DSFEs[mark](data))
+        loss = F.nll_loss(F.log_softmax(output, dim=1), labels.squeeze())
+    
+        self.zero_grad()
+        loss.backward()
+    
+        grad = data.grad.data  # [B, D]
+    
+        if uncertainty is not None:
+          #  uncertainty: [B] → expand to [B, 1] for broadcasting
+            adaptive_eps = epsilon * (1.0 - uncertainty).unsqueeze(1)  # [B, 1]
+            perturbation = adaptive_eps * grad.sign()  # [B, D]
+        else:
+            perturbation = epsilon * grad.sign()
+    
+        perturbed_data = data + perturbation
+        return perturbed_data.detach()
